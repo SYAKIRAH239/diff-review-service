@@ -11,6 +11,8 @@ import json
 from fastapi.responses import StreamingResponse
 import hashlib
 from collections import deque
+from fastapi.exceptions import RequestValidationError
+from llm_provider import llm_review_diff
 
 app = FastAPI()
 START_TIME = time.time()
@@ -52,7 +54,12 @@ async def process_review_job(job_id: str):
 
         try:
             job = JOBS[job_id]
-            findings, total_findings, num_chunks = review_diff(job["diff"], job["options"]["maxFindings"])
+            provider = job["options"].get("provider", "mock")
+
+            if provider == "llm":
+                findings, total_findings, num_chunks = llm_review_diff(job["diff"], job["options"]["maxFindings"])
+            else:
+                findings, total_findings, num_chunks = review_diff(job["diff"], job["options"]["maxFindings"])
 
             for finding in findings:
                 JOBS[job_id]["events"].append({"event": "finding", "data": finding})
@@ -143,6 +150,23 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             response.headers[key] = value
     return response
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+
+    is_json_decode_error = any(err.get("type") == "json_invalid" for err in errors)
+
+    if is_json_decode_error:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "invalid_json", "message": "Request body is not valid JSON"}}
+        )
+
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "invalid_diff", "message": "Request body does not match the expected shape"}}
+    )
+
 @app.get("/health")
 def health():
     return {
@@ -184,6 +208,18 @@ async def create_review(
         raise HTTPException(
             status_code=422,
             detail={"code": "invalid_diff", "message": "diff is empty"}
+        )
+
+    if "+++" not in body.diff or "---" not in body.diff:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_diff", "message": "diff does not appear to be a valid unified diff"}
+        )
+
+    if "@@" not in body.diff:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_diff", "message": "diff has no hunk headers"}
         )
 
     if "+++" not in body.diff and "---" not in body.diff:
@@ -247,6 +283,7 @@ async def create_review(
 
 
 @app.get("/v1/reviews/{job_id}")
+@app.get("/v1/reviews/{job_id}")
 def get_review(job_id: str, auth=Depends(require_auth)):
     job = JOBS.get(job_id)
     if job is None:
@@ -255,12 +292,17 @@ def get_review(job_id: str, auth=Depends(require_auth)):
             detail={"code": "not_found", "message": f"No job found with id {job_id}"}
         )
 
-    return {
+    response = {
         "jobId": job["jobId"],
         "status": job["status"],
         "findings": job["findings"],
         "usage": job["usage"],
     }
+
+    if job["status"] == "failed" and "error" in job:
+        response["error"] = job["error"]
+
+    return response
 
 @app.get("/v1/reviews/{job_id}/stream")
 async def stream_review(job_id: str, auth=Depends(require_auth)):
