@@ -7,6 +7,10 @@ import os
 import uuid
 from rules import review_diff
 import asyncio
+import json
+from fastapi.responses import StreamingResponse
+import hashlib
+from collections import deque
 
 app = FastAPI()
 START_TIME = time.time()
@@ -29,25 +33,44 @@ class ReviewRequest(BaseModel):
 
 # --- in-memory job store ---
 JOBS = {}  # jobId -> job dict
+CACHE = {}       # content_hash -> jobId
+IDEMPOTENCY = {} # idempotency_key -> {"body_hash": ..., "jobId": ...}
 MAX_CONCURRENT_JOBS = 4
 job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+RATE_LIMIT_PER_MINUTE = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+request_log = {}  # token -> deque of timestamps
 
 # Turn review processing into a background async function
 async def process_review_job(job_id: str):
     async with job_semaphore:
         JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["events"].append({"event": "status", "data": {"status": "running"}})
 
         try:
             job = JOBS[job_id]
-            findings, total_findings = review_diff(job["diff"], job["options"]["maxFindings"])
+            findings, total_findings, num_chunks = review_diff(job["diff"], job["options"]["maxFindings"])
+
+            for finding in findings:
+                JOBS[job_id]["events"].append({"event": "finding", "data": finding})
 
             JOBS[job_id]["findings"] = findings
-            JOBS[job_id]["usage"]["chunks"] = 1
+            JOBS[job_id]["usage"]["chunks"] = num_chunks
             JOBS[job_id]["status"] = "done"
+
+            JOBS[job_id]["events"].append({"event": "status", "data": {"status": "done"}})
+            JOBS[job_id]["events"].append({
+                "event": "done",
+                "data": {"total": total_findings, "usage": JOBS[job_id]["usage"]}
+            })
 
         except Exception as e:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = {"code": "internal", "message": str(e)}
+            JOBS[job_id]["events"].append({"event": "status", "data": {"status": "failed"}})
             
 # bearer token authentication
 MY_BEARER_TOKEN = os.environ.get("SERVICE_BEARER_TOKEN", "changeme-dev-token")
@@ -59,6 +82,49 @@ def require_auth(authorization: str = Header(default=None)):
     if token != MY_BEARER_TOKEN:
         raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "Invalid bearer token"})
 
+def check_rate_limit(token: str):
+    now = time.time()
+
+    if token not in request_log:
+        request_log[token] = deque()
+
+    timestamps = request_log[token]
+
+    while timestamps and timestamps[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
+        timestamps.popleft()
+
+    if len(timestamps) >= RATE_LIMIT_PER_MINUTE:
+        retry_after = int(RATE_LIMIT_WINDOW_SECONDS - (now - timestamps[0])) + 1
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "rate_limited", "message": "Too many requests, please slow down"},
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    timestamps.append(now)
+
+def compute_content_hash(diff: str, options: dict) -> str:
+    payload = json.dumps({"diff": diff, "options": options}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+async def event_generator(job_id: str):
+    index = 0
+    while True:
+        job = JOBS.get(job_id)
+        if job is None:
+            break
+
+        events = job["events"]
+        while index < len(events):
+            ev = events[index]
+            yield f"event: {ev['event']}\ndata: {json.dumps(ev['data'])}\n\n"
+            index += 1
+
+        if job["status"] in ("done", "failed"):
+            break
+
+        await asyncio.sleep(0.2)
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(exc.detail, dict):
@@ -67,7 +133,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     else:
         code = "internal"
         message = str(exc.detail)
-    return error_response(exc.status_code, code, message)
+
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": code, "message": message}}
+    )
+    if exc.headers:
+        for key, value in exc.headers.items():
+            response.headers[key] = value
+    return response
 
 @app.get("/health")
 def health():
@@ -91,7 +165,13 @@ def spec():
     }
 
 @app.post("/v1/reviews", status_code=202)
-async def create_review(body: ReviewRequest, auth=Depends(require_auth)):
+async def create_review(
+    body: ReviewRequest,
+    auth=Depends(require_auth),
+    idempotency_key: str = Header(default=None, alias="Idempotency-Key"),
+):
+    check_rate_limit(MY_BEARER_TOKEN)
+
     diff_bytes = body.diff.encode("utf-8")
 
     if len(diff_bytes) > 1_048_576:
@@ -112,20 +192,54 @@ async def create_review(body: ReviewRequest, auth=Depends(require_auth)):
             detail={"code": "invalid_diff", "message": "diff does not appear to be a valid unified diff"}
         )
 
+    options_dict = body.options.dict()
+    content_hash = compute_content_hash(body.diff, options_dict)
+
+    if idempotency_key:
+        existing = IDEMPOTENCY.get(idempotency_key)
+        if existing:
+            if existing["content_hash"] == content_hash:
+                job_id = existing["jobId"]
+                JOBS[job_id]["usage"]["cacheHit"] = True
+                return {"jobId": job_id, "status": JOBS[job_id]["status"]}
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "idempotency_conflict", "message": "Idempotency-Key reused with a different body"}
+                )
+
+    if content_hash in CACHE:
+        job_id = CACHE[content_hash]
+        JOBS[job_id]["usage"]["cacheHit"] = True
+        if idempotency_key:
+            IDEMPOTENCY[idempotency_key] = {"content_hash": content_hash, "jobId": job_id}
+        return {"jobId": job_id, "status": JOBS[job_id]["status"]}
+
+    if content_hash in CACHE:
+        job_id = CACHE[content_hash]
+        if idempotency_key:
+            IDEMPOTENCY[idempotency_key] = {"content_hash": content_hash, "jobId": job_id}
+        return {"jobId": job_id, "status": JOBS[job_id]["status"]}
+
     job_id = str(uuid.uuid4())
 
     JOBS[job_id] = {
         "jobId": job_id,
         "status": "queued",
         "findings": [],
+        "events": [{"event": "status", "data": {"status": "queued"}}],
         "usage": {
             "inputBytes": len(diff_bytes),
             "chunks": 0,
             "cacheHit": False,
         },
         "diff": body.diff,
-        "options": body.options.dict(),
+        "options": options_dict,
     }
+
+    CACHE[content_hash] = job_id
+    if idempotency_key:
+        IDEMPOTENCY[idempotency_key] = {"content_hash": content_hash, "jobId": job_id}
 
     asyncio.create_task(process_review_job(job_id))
 
@@ -147,3 +261,13 @@ def get_review(job_id: str, auth=Depends(require_auth)):
         "findings": job["findings"],
         "usage": job["usage"],
     }
+
+@app.get("/v1/reviews/{job_id}/stream")
+async def stream_review(job_id: str, auth=Depends(require_auth)):
+    if job_id not in JOBS:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "not_found", "message": f"No job found with id {job_id}"}
+        )
+
+    return StreamingResponse(event_generator(job_id), media_type="text/event-stream")

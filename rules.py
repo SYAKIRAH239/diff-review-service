@@ -1,5 +1,7 @@
 import re
 from parser import parse_diff
+from parser import parse_diff
+from chunker import split_into_file_diffs, chunk_file_diffs
 
 MOCK_RULES = [
     {
@@ -108,34 +110,39 @@ def finalize_findings(findings, max_findings=100):
     return truncated, total
 
 def review_diff(diff_text: str, max_findings: int = 100):
-    added_lines = parse_diff(diff_text)
+    file_diffs = split_into_file_diffs(diff_text)
+    chunks = chunk_file_diffs(file_diffs)
 
-    findings = []
+    all_findings = []
 
-    for entry in added_lines:
-        for rule in MOCK_RULES:
-            if rule["check"](entry["content"]):
-                findings.append({
-                    "id": f"{rule['ruleId']}:{entry['path']}:{entry['line']}",
-                    "ruleId": rule["ruleId"],
-                    "path": entry["path"],
-                    "line": entry["line"],
-                    "severity": rule["severity"],
-                    "category": rule["category"],
-                    "title": rule["title"],
-                    "evidence": entry["content"],
-                })
+    for chunk_text in chunks:
+        added_lines = parse_diff(chunk_text)
 
-    for entry in find_empty_catch_blocks(added_lines):
-        findings.append({
-            "id": f"MOCK-004:{entry['path']}:{entry['line']}",
-            "ruleId": "MOCK-004",
-            "path": entry["path"],
-            "line": entry["line"],
-            "severity": "high",
-            "category": "correctness",
-            "title": "swallowed exception",
-            "evidence": entry["content"],
-        })
+        for entry in added_lines:
+            for rule in MOCK_RULES:
+                if rule["check"](entry["content"]):
+                    all_findings.append({
+                        "id": f"{rule['ruleId']}:{entry['path']}:{entry['line']}",
+                        "ruleId": rule["ruleId"],
+                        "path": entry["path"],
+                        "line": entry["line"],
+                        "severity": rule["severity"],
+                        "category": rule["category"],
+                        "title": rule["title"],
+                        "evidence": entry["content"],
+                    })
 
-    return finalize_findings(findings, max_findings)
+        for entry in find_empty_catch_blocks(added_lines):
+            all_findings.append({
+                "id": f"MOCK-004:{entry['path']}:{entry['line']}",
+                "ruleId": "MOCK-004",
+                "path": entry["path"],
+                "line": entry["line"],
+                "severity": "high",
+                "category": "correctness",
+                "title": "swallowed exception",
+                "evidence": entry["content"],
+            })
+
+    findings, total_findings = finalize_findings(all_findings, max_findings)
+    return findings, total_findings, len(chunks)
